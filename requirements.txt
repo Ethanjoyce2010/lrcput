@@ -1,0 +1,4 @@
+mutagen>=1.46.0
+eyed3>=0.9.7
+tqdm>=4.66.0
+requests>=2.31.0
