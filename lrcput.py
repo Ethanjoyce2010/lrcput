@@ -7,35 +7,74 @@ import eyed3
 from tqdm import tqdm
 import requests
 from urllib.parse import urlencode
-from mutagen import File as MutaFile
+import mutagen
+import eyed3.id3
 import logging
+from typing import Optional, Tuple, List
+import importlib
 
-def has_embedded_lyrics(audio):
+# Load mutagen.File dynamically to avoid static analysis warnings from Pylance
+_mutagen_mod = importlib.import_module('mutagen')
+MutagenFile = getattr(_mutagen_mod, 'File', None)
+
+def has_embedded_lyrics(audio) -> bool:
+    """Return True if the given Mutagen/eyed3 audio object has embedded lyrics.
+
+    The function accepts different audio object types (FLAC, MP4, eyed3 AudioFile).
+    """
     if isinstance(audio, FLAC):
         return 'LYRICS' in audio
     elif isinstance(audio, MP4):
         return bool(audio.tags and ('\xa9lyr' in audio.tags))
     elif isinstance(audio, eyed3.core.AudioFile):
-        return audio.tag.lyrics is not None
+        # audio.tag may be None; use safe getattr to avoid static analysis complaints
+        return bool(audio.tag and getattr(audio.tag, 'lyrics', None))
     return False
 
-def embed_lyrics_text_to_file(audio_path, lyrics):
-    """Embed given lyrics text into the audio file. Returns output path (may be converted) or None on in-place."""
+def embed_lyrics_text_to_file(audio_path: str, lyrics: str) -> Optional[str]:
+    """Embed given lyrics text into the audio file.
+
+    Returns the output path if the file was converted (e.g. to mp3). Returns None if embedded in-place.
+    Raises an exception on failure.
+    """
     import subprocess
     ext = os.path.splitext(audio_path)[1].lower()
     try:
         if ext == '.mp3':
             audio = eyed3.load(audio_path)
-            if not audio or not audio.tag:
+            if audio is None:
+                raise Exception("Failed to load MP3 for embedding")
+            # Ensure tag exists
+            if audio.tag is None:
                 audio.initTag()
-            audio.tag.lyrics.set(lyrics)
-            audio.tag.save(version=eyed3.id3.ID3_V2_3)
+            # audio.tag members are not well-known to type checkers; use getattr/setattr and narrow ignores
+            try:
+                # Preferred API: use lyrics object if available
+                if getattr(audio.tag, 'lyrics', None) is not None:
+                    audio.tag.lyrics.set(lyrics)  # type: ignore[attr-defined]
+                else:
+                    # Fallback: set attribute directly
+                    setattr(audio.tag, 'lyrics', lyrics)  # type: ignore[arg-type]
+            except Exception:
+                # Still attempt to set attribute directly in case library versions differ
+                setattr(audio.tag, 'lyrics', lyrics)  # type: ignore[arg-type]
+            # Save tag (type checker may not know save exists)
+            audio.tag.save(version=eyed3.id3.ID3_V2_3)  # type: ignore[attr-defined]
         elif ext == '.flac':
             audio = FLAC(audio_path)
             audio['LYRICS'] = lyrics
             audio.save()
         elif ext == '.m4a':
             audio = MP4(audio_path)
+            # Ensure tags exist before subscripting (mutagen may set tags=None)
+            if audio.tags is None:
+                # mutagen.mp4.MP4 provides add_tags() to initialize tags
+                try:
+                    audio.add_tags()
+                except Exception:
+                    # If tags could not be created, raise to avoid silent failures
+                    raise Exception("Unable to initialize MP4 tags for: %s" % audio_path)
+            assert audio.tags is not None
             audio.tags['\xa9lyr'] = lyrics
             audio.save()
         else:
@@ -45,19 +84,32 @@ def embed_lyrics_text_to_file(audio_path, lyrics):
                 'ffmpeg', '-y', '-i', audio_path, mp3_path
             ], check=True)
             audio = eyed3.load(mp3_path)
-            if not audio or not audio.tag:
+            if audio is None:
+                raise Exception("Failed to load converted MP3 for embedding")
+            if audio.tag is None:
                 audio.initTag()
-            audio.tag.lyrics.set(lyrics)
-            audio.tag.save(version=eyed3.id3.ID3_V2_3)
+            # Set lyrics defensively (type checkers may not know attribute names)
+            try:
+                if getattr(audio.tag, 'lyrics', None) is not None:
+                    audio.tag.lyrics.set(lyrics)  # type: ignore[attr-defined]
+                else:
+                    setattr(audio.tag, 'lyrics', lyrics)  # type: ignore[arg-type]
+            except Exception:
+                setattr(audio.tag, 'lyrics', lyrics)  # type: ignore[arg-type]
+            audio.tag.save(version=eyed3.id3.ID3_V2_3)  # type: ignore[attr-defined]
             return mp3_path
     except Exception as e:
         raise Exception(f"Failed to embed lyrics: {e}")
     return None
 
-def embed_lrc(directory, skip_existing, reduce_lrc, recursive):
+def embed_lrc(directory: str, skip_existing: bool, reduce_lrc: bool, recursive: bool) -> Tuple[int, int, List[str]]:
+    """Embed .lrc files found in `directory` into supported audio files.
+
+    Returns a tuple: (total_audio_files, embedded_lyrics_files, failed_files)
+    """
     total_audio_files = 0
     embedded_lyrics_files = 0
-    failed_files = []
+    failed_files: List[str] = []
     
     audio_files = []
     for root, dirs, files in os.walk(directory):
@@ -116,53 +168,29 @@ def embed_lrc(directory, skip_existing, reduce_lrc, recursive):
 
 import subprocess
 
-def embed_lrc_single(audio_path, lrc_path):
-    ext = os.path.splitext(audio_path)[1].lower()
+def embed_lrc_single(audio_path: str, lrc_path: str) -> Optional[str]:
+    """Embed lyrics from an .lrc file into a single audio file.
+
+    Returns output path if conversion was performed, otherwise None.
+    """
     lyrics = open(lrc_path, 'r', encoding='utf-8').read()
-    try:
-        if ext == '.mp3':
-            import eyed3
-            audio = eyed3.load(audio_path)
-            if not audio or not audio.tag:
-                audio.initTag()
-            audio.tag.lyrics.set(lyrics)
-            audio.tag.save()
-        elif ext == '.flac':
-            audio = FLAC(audio_path)
-            audio['LYRICS'] = lyrics
-            audio.save()
-        elif ext == '.m4a':
-            audio = MP4(audio_path)
-            audio.tags['\xa9lyr'] = lyrics
-            audio.save()
-        else:
-            # Convert to mp3 using ffmpeg, then embed
-            mp3_path = os.path.splitext(audio_path)[0] + '_converted.mp3'
-            subprocess.run([
-                'ffmpeg', '-y', '-i', audio_path, mp3_path
-            ], check=True)
-            import eyed3
-            audio = eyed3.load(mp3_path)
-            if not audio or not audio.tag:
-                audio.initTag()
-            audio.tag.lyrics.set(lyrics)
-            audio.tag.save()
-            return mp3_path
-    except Exception as e:
-        raise Exception(f"Failed to embed lyrics: {e}")
+    return embed_lyrics_text_to_file(audio_path, lyrics)
 
 def read_tags_for_lrclib(audio_path):
-    """Extract artist, title, and duration (if available) for LRCLib lookup."""
+    """Extract artist, title, and duration (if available) for LRCLib lookup.
+
+    Returns (artist, title, duration) where artist/title may be None when unavailable.
+    """
     ext = os.path.splitext(audio_path)[1].lower()
     artist = title = None
     duration = None
     try:
         if ext == '.mp3':
             audio = eyed3.load(audio_path)
-            if audio and audio.tag:
-                artist = audio.tag.artist
-                title = audio.tag.title
-                duration = int(audio.info.time_secs) if audio.info else None
+            if audio is not None and audio.tag is not None:
+                artist = getattr(audio.tag, 'artist', None)
+                title = getattr(audio.tag, 'title', None)
+                duration = int(audio.info.time_secs) if getattr(audio, 'info', None) else None
         elif ext == '.flac':
             audio = FLAC(audio_path)
             artist = (audio.get('artist') or [None])[0]
@@ -176,7 +204,11 @@ def read_tags_for_lrclib(audio_path):
             duration = int(audio.info.length) if audio.info else None
         else:
             # Generic fallback using mutagen for other formats (wav/ogg/aac/wma/alac etc.)
-            mf = MutaFile(audio_path, easy=True)
+            if MutagenFile is None:
+                # Fallback: try attribute access (runtime)
+                mf = importlib.import_module('mutagen').File(audio_path, easy=True)
+            else:
+                mf = MutagenFile(audio_path, easy=True)
             if mf and mf.tags:
                 # easy tags are lists
                 artist = (mf.tags.get('artist') or [None])[0]
@@ -191,8 +223,11 @@ def read_tags_for_lrclib(audio_path):
         pass
     return artist, title, duration
 
-def parse_artist_title_from_filename(path):
-    """Heuristic parsing from filename like 'Artist - Title.ext' or 'Artist_Title.ext'."""
+def parse_artist_title_from_filename(path: str) -> Tuple[Optional[str], str]:
+    """Heuristic parsing from filename like 'Artist - Title.ext' or 'Artist_Title.ext'.
+
+    Returns (artist, title) where artist may be None if not present.
+    """
     base = os.path.splitext(os.path.basename(path))[0]
     # common patterns
     candidates = []
@@ -209,8 +244,11 @@ def parse_artist_title_from_filename(path):
         candidates.append((None, base.strip()))
     return candidates[0]
 
-def fetch_lyrics_from_lrclib(artist, title, duration=None):
-    """Fetch synced lyrics from LRCLib. Returns lyrics string or None."""
+def fetch_lyrics_from_lrclib(artist: Optional[str], title: Optional[str], duration: Optional[int]=None) -> Optional[str]:
+    """Fetch synced lyrics from LRCLib. Returns lyrics string or None.
+
+    artist/title may be None; function returns None in that case.
+    """
     if not artist or not title:
         return None
     base = 'https://lrclib.net/api'
@@ -218,7 +256,7 @@ def fetch_lyrics_from_lrclib(artist, title, duration=None):
         # Try /get first
         params = {"track_name": title, "artist_name": artist}
         if duration:
-            params["duration"] = duration
+            params["duration"] = str(duration)
         r = requests.get(f"{base}/get", params=params, timeout=10)
         if r.status_code == 200:
             data = r.json()
@@ -243,8 +281,11 @@ def fetch_lyrics_from_lrclib(artist, title, duration=None):
         return None
     return None
 
-def embed_lrclib_batch(directory, skip_existing, reduce_lrc, recursive):
-    """Batch embed lyrics from LRCLib into supported files in directory."""
+def embed_lrclib_batch(directory: str, skip_existing: bool, reduce_lrc: bool, recursive: bool) -> Tuple[int, int, List[str]]:
+    """Batch embed lyrics from LRCLib into supported files in directory.
+
+    Returns (total_files, embedded_count, failed_list)
+    """
     audio_files = []
     for root, dirs, files in os.walk(directory):
         for file in files:
@@ -274,7 +315,7 @@ def embed_lrclib_batch(directory, skip_existing, reduce_lrc, recursive):
                         audio_obj = eyed3.load(audio_path)
                     elif file.endswith('.m4a'):
                         audio_obj = MP4(audio_path)
-                    if audio_obj and has_embedded_lyrics(audio_obj):
+                    if audio_obj is not None and has_embedded_lyrics(audio_obj):
                         logging.info(f"[SKIP] Already has embedded lyrics: {file}")
                         pbar.set_postfix({"status": "skipped"})
                         pbar.update(1)
@@ -327,7 +368,7 @@ def embed_lrclib_batch(directory, skip_existing, reduce_lrc, recursive):
         embedded += manual_embedded
     return len(audio_files), embedded, failed
 
-def _manual_prompt_and_embed(file_list):
+def _manual_prompt_and_embed(file_list: List[str]) -> int:
     """Prompt user for artist/title for each file in the list, then fetch and embed. Returns count embedded."""
     import tkinter as tk
     from tkinter import simpledialog, messagebox
@@ -513,5 +554,48 @@ Polished by EthanJoyce2010"""
 
     root.mainloop()
 
+def main() -> None:
+    """Command-line entrypoint. If no CLI args are given, the GUI is launched.
+
+    CLI modes:
+    - --batch DIR : embed .lrc files from DIR
+    - --lrclib DIR : search LRCLib and embed for files in DIR
+    - --single AUDIO --lrc FILE : embed a single .lrc into AUDIO
+    Additional flags: --skip-existing, --reduce, --recursive
+    """
+    logging.basicConfig(level=logging.INFO, format='[%(levelname)s] %(message)s')
+    parser = argparse.ArgumentParser(prog='lrcput', description='Embed LRC lyrics into audio files (GUI if no args)')
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument('--batch', metavar='DIR', help='Embed .lrc files from directory')
+    group.add_argument('--lrclib', metavar='DIR', help='Search LRCLib and embed lyrics for files in directory')
+    group.add_argument('--single', metavar='AUDIO', help='Embed a single LRC into AUDIO file')
+    parser.add_argument('--lrc', metavar='FILE', help='LRC file to embed for --single')
+    parser.add_argument('--skip-existing', action='store_true', help='Skip files that already have embedded lyrics')
+    parser.add_argument('--reduce', action='store_true', help='Remove .lrc files after successful embedding (batch mode)')
+    parser.add_argument('--recursive', action='store_true', help='Recursively search directories')
+    args = parser.parse_args()
+
+    # If no args provided, launch GUI
+    if not any([args.batch, args.lrclib, args.single]):
+        main_gui()
+        return
+
+    # CLI modes
+    if args.batch:
+        total, embedded, failed = embed_lrc(args.batch, args.skip_existing, args.reduce, args.recursive)
+        logging.info(f"Total: {total}, Embedded: {embedded}, Failed: {len(failed)}")
+    elif args.lrclib:
+        total, embedded, failed = embed_lrclib_batch(args.lrclib, args.skip_existing, False, args.recursive)
+        logging.info(f"Total: {total}, Embedded: {embedded}, Failed: {len(failed)}")
+    elif args.single:
+        if not args.lrc:
+            parser.error('--single requires --lrc FILE')
+        out = embed_lrc_single(args.single, args.lrc)
+        if out:
+            logging.info(f"Embedded; output file: {out}")
+        else:
+            logging.info("Embedded in-place")
+
+
 if __name__ == "__main__":
-    main_gui()
+    main()
