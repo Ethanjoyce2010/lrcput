@@ -1,4 +1,5 @@
 import os
+import re
 import shutil
 import argparse
 from mutagen.flac import FLAC
@@ -228,7 +229,8 @@ def parse_artist_title_from_filename(path: str) -> Tuple[Optional[str], str]:
 
     Returns (artist, title) where artist may be None if not present.
     """
-    base = os.path.splitext(os.path.basename(path))[0]
+    # Normalize to handle both Windows (\\) and POSIX (/) separators regardless of host OS
+    base = os.path.splitext(re.split(r"[\\/]", path)[-1])[0]
     # common patterns
     candidates = []
     if ' - ' in base:
